@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS compute & logging + scale down trigger and policy. Depends on the IAM, core, and
+  DNS stacks.
+
+Parameters:
+  # Upload Docker image to ECR before deploying this stack. Get the ECR URI using scripts/setup.sh
+  MinecraftEcrImageUri:
+    Type: String
+    Description: Full ECR Image URI for the minecraft-server image
+  ActivityMonitorEcrImageUri:
+    Type: String
+    Description: Full ECR Image URI for the activity-monitor sidecar image
+  MinecraftIamStackName:
+    Type: String
+    Description: The name of the IAM stack with defined roles and permissions
+  MinecraftCoreStack:
+    Type: String
+    Description: The name of the baseline stack with storage and networking infrastructure
+  # TODO: Strongly consider moving this to Secrets Manager.
+  RconPassword:
+    Type: String
+    NoEcho: true
+    Description: Password for RCON admin console access. Written into server.properties by the
+      Docker entrypoint script on every boot. The RCON port is restricted to AdminIp in the core
+      stack's security group, but this password is still the only protection against anyone on
+      that IP.
+
+Resources:
+  # =================================
+  # COMPUTE & LOGGING INFRASTRUCTURE
+  # =================================
+  MinecraftLogGroup:
+    Type: AWS::Logs::LogGroup
+    # In dev, delete everything to ensure clean stack teardowns when rapidly redeploying stacks.
+    # TODO: When moving to prod, swap this from Delete to Retain
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Ignore the cfn-guard warning. The KMS cost is not worth it for this type of project.
+    Properties:
+      LogGroupName: /ecs/minecraft-server
+      RetentionInDays: 7
+
+  ActivityMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    # In dev, delete everything to ensure clean stack teardowns when rapidly redeploying stacks.
+    # TODO: When moving to prod, swap this from Delete to Retain
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Ignore the cfn-guard warning. The KMS cost is not worth it for this type of project.
+    Properties:
+      LogGroupName: /ecs/activity-monitor
+      RetentionInDays: 7
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: minecraft-cluster
+      
+  EcsClusterCapacityProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref EcsCluster
+      # FARGATE is included alongside FARGATE_SPOT so the option to fall back to standard Fargate
+      # remains available (e.g., a future strategy change), even though the service's
+      # CapacityProviderStrategy below targets only Spot.
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: minecraft-task
+      # Adjusted for dev cost savings to 1 vCPU.
+      # TODO: Consider 2 vCPU so the minecraft server jar can have its own thread.
+      Cpu: '1024'
+      # Adjusted for dev cost savings to 2 GB RAM.
+      # TODO: Rightsize this based on avg() memory use.
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: ${MinecraftIamStackName}-EcsExecutionRoleArn
+      TaskRoleArn: !ImportValue
+        Fn::Sub: ${MinecraftIamStackName}-EcsTaskRoleArn
+      Volumes:
+        - Name: minecraft-data
+          EFSVolumeConfiguration:
+            FilesystemId: !ImportValue
+              Fn::Sub: ${MinecraftCoreStack}-EfsFileSystemId
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !ImportValue
+                Fn::Sub: ${MinecraftCoreStack}-EfsAccessPointId
+              IAM: DISABLED
+      ContainerDefinitions:
+        - Name: minecraft
+          Image: !Ref MinecraftEcrImageUri
+          StopTimeout: 120
+          Essential: true
+          PortMappings:
+            # Server port changed from 25565 to 35132 to avoid standard port scanners
+            - ContainerPort: 35132
+              HostPort: 35132
+              Protocol: tcp
+            # RCON admin console. Access is restricted at the security group level, (AdminIp
+            # parameter in the core stack) not here.
+            - ContainerPort: 25575
+              HostPort: 25575
+              Protocol: tcp
+          Environment:
+            # Read by the Docker entrypoint script and written into server.properties on every boot
+            # alongside online-mode/whitelist enforcement.
+            - Name: RCON_PASSWORD
+              Value: !Ref RconPassword
+          MountPoints:
+            - SourceVolume: minecraft-data
+              ContainerPath: /data
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref MinecraftLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+        - Name: activity-monitor
+          Image: !Ref ActivityMonitorEcrImageUri
+          Essential: false
+          Environment:
+            - Name: RCON_PASSWORD
+              Value: !Ref RconPassword
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ActivityMonitorLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  EcsService:
+    Type: AWS::ECS::Service
+     # Cost-saving measure: run entirely on Fargate Spot. Since wake is cheap and cold boots are
+     # already expected (DesiredCount starts at 0), a Spot interruption is an acceptable tradeoff.
+    DependsOn: EcsClusterCapacityProviders
+    Properties:
+      Cluster: !Ref EcsCluster
+      ServiceName: minecraft-service
+      TaskDefinition: !Ref TaskDefinition
+      # Decided to launch with zero and cold boot the first task using the API.
+      DesiredCount: 0
+      # LaunchType and CapacityProviderStrategy are mutually exclusive; Spot-only placement is
+      # expressed here instead of via LaunchType.
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !ImportValue
+              Fn::Sub: ${MinecraftCoreStack}-PublicSubnet
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: ${MinecraftCoreStack}-EcsSecurityGroup
+          AssignPublicIp: ENABLED
+  
+  # =============================
+  # SCALE-TO-ZERO INFRASTRUCTURE
+  # =============================
+  EcsScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      # Minecraft doesn't scale out, so never exceed one task.
+      MaxCapacity: 1
+      MinCapacity: 0
+      ResourceId: !Sub "service/${EcsCluster}/${EcsService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ScaleDownPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: scale-down-to-zero
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref EcsScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity
+        # 25 minute cooldown = Period * (EvaluationPeriods + 1 buffer period).
+        # The cooldown should prevent the policy from re-firing until the alarm has a full window
+        # to clear.
+        Cooldown: 1500
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: 0
+
+  IdleServerAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: minecraft-idle-timeout
+      AlarmDescription: Triggers scale-down to 0 when playercount is sustained at 0 for 20 minutes
+      Namespace: Minecraft
+      MetricName: HostIsActive
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 4
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # Missing datapoints (e.g. while DesiredCount is 0) count as non-breaching, so the alarm can
+      # clear to OK instead of latching in ALARM on stale data. Once the policy has fired, this
+      # ensures that the alarm is OK before the cooldown expires, regardless if DesiredCount has
+      # been increased to 1.
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ScaleDownPolicy

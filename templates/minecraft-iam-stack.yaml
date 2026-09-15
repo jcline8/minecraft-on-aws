@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IAM roles and policies for ECS and Lambda. Depends on DNS stack.
+
+Parameters:
+  MinecraftDnsStackName:
+    Type: String
+    Description: The name of the DNS stack with the delegated hosted zone
+
+Resources:
+  # ========================
+  # ECS Task Execution Role
+  # ========================
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ecs-execution-role
+      Description: Execution role used by ECS Fargate to pull images from ECR and send logs to
+        CloudWatch.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # =======================================================================
+  # ECS Task Role for Activity-Monitor Sidecar (CloudWatch Metric Publish)
+  # =======================================================================
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ecs-task-role
+      Description: Task role assumed by code running inside the Minecraft task's containers.
+        Currently used only by the activity-monitor sidecar to publish CloudWatch metrics.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  EcsTaskPutMetricDataPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ecs-task-put-metric-data
+      Roles:
+        - !Ref EcsTaskRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+            # PutMetricData does not support resource-level restriction. Scope is narrowed with the
+            # condition.
+            Resource: '*'
+            Condition:
+              StringEquals:
+                # Hard coded value - will need to change if activity_monitor.py ever uses a
+                # different metric namespace.
+                cloudwatch:namespace: Minecraft
+
+  # ============================================
+  # Wake Lambda Role (Logs & ECS Service Edits)
+  # ============================================
+  WakeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wake-lambda-role
+      Description: Execution role for the Lambda that wakes the Minecraft ECS service on an incoming
+        webhook.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  WakeLambdaEcsAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: wake-lambda-ecs-access
+      Roles:
+        - !Ref WakeLambdaRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ecs:DescribeServices
+              - ecs:UpdateService
+            # Hard coded to the minecraft-cluster ECS Cluster and minecraft-service ECS Service
+            # created in the compute stack. We have to hard code instead of import because the
+            # compute stack depends on the IAM stack.
+            Resource: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/minecraft-cluster/minecraft-service
+
+  WakeLambdaLogCreatePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: wake-lambda-log-create
+      Roles:
+        - !Ref WakeLambdaRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            # Hard coded to the minecraft-wake-trigger log group created in the control plane stack.
+            # We have to hard code instead of import because the control plane stack depends on the
+            # IAM stack.
+            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/minecraft-wake-trigger:*
+
+  # ==================================================================
+  # DNS Update Lambda Role (Route 53 Update on ECS Task State Change)
+  # ==================================================================
+  DnsUpdateLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dns-update-lambda-role
+      Description: Execution role for the Lambda that updates the Minecraft server's DNS record with
+        its current public IP on ECS task state change.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  DnsUpdateNetworkAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: dns-update-network-access
+      Roles:
+        - !Ref DnsUpdateLambdaRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeNetworkInterfaces
+            # DescribeNetworkInterfaces does not support resource-level restriction.
+            Resource: '*'
+
+  DnsUpdateRoute53AccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: dns-update-route53-access
+      Roles:
+        - !Ref DnsUpdateLambdaRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - route53:ChangeResourceRecordSets
+            Resource: !Sub
+              - arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}
+              - HostedZoneId: !ImportValue
+                  Fn::Sub: ${MinecraftDnsStackName}-HostedZoneId
+
+  DnsUpdateLogCreatePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: dns-update-log-create
+      Roles:
+        - !Ref DnsUpdateLambdaRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            # Hard coded to the minecraft-dns-update log group created in the control plane stack.
+            # We have to hard code instead of import because the control plane stack depends on the
+            # IAM stack.
+            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/minecraft-dns-update:*
+
+Outputs:
+  EcsExecutionRoleArn:
+    Description: ARN of the ECS Execution Role
+    Value: !GetAtt EcsExecutionRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-EcsExecutionRoleArn
+
+  EcsTaskRoleArn:
+    Description: ARN of the ECS Task Role
+    Value: !GetAtt EcsTaskRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-EcsTaskRoleArn
+
+  WakeLambdaRoleArn:
+    Description: ARN of the Wake Lambda Role
+    Value: !GetAtt WakeLambdaRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-WakeLambdaRoleArn
+
+  DnsUpdateLambdaRoleArn:
+    Description: ARN of the DNS Update Lambda Role
+    Value: !GetAtt DnsUpdateLambdaRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-DnsUpdateLambdaRoleArn

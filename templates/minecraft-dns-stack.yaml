@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Route53 hosted zone to delegate back to IP reservation in the payer account.
+  No dependencies.
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Subdomain this hosted zone owns. Must be delegated from the parent zone in the
+      payer account via NS records (see NameServers output).
+
+Resources:
+  # ===================
+  # DELEGATED DNS ZONE
+  # ===================
+  MinecraftHostedZone:
+    Type: AWS::Route53::HostedZone
+    # In dev, deleting this stack or updating the hosted zone means nameservers will change,
+    # requiring the NS records in the payer account to be re-pasted.
+    # TODO: Consider swapping this to Retain when changes are more infrequent.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: Delegated zone for Minecraft dynamic DNS updates
+
+  MinecraftSrvRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref MinecraftHostedZone
+      Name: !Sub _minecraft._tcp.play.${DomainName}
+      Type: SRV
+      TTL: '60'
+      # Format: [Priority] [Weight] [Port] [Target Host]
+      ResourceRecords:
+        - !Sub 0 5 35132 mc.${DomainName}
+
+Outputs:
+  HostedZoneId:
+    Description: Route 53 Hosted Zone ID for the delegated subdomain
+    Value: !Ref MinecraftHostedZone
+    Export:
+      Name: !Sub ${AWS::StackName}-HostedZoneId
+
+  DomainName:
+    Description: The domain name this hosted zone owns
+    Value: !Ref DomainName
+    Export:
+      Name: !Sub ${AWS::StackName}-DomainName
+
+  NameServers:
+    Description: Paste these as NS records under DomainName in the payer account's parent hosted
+      zone to complete delegation.
+    Value: !Join
+      - ', '
+      - !GetAtt MinecraftHostedZone.NameServers

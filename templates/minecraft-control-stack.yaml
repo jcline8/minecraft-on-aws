@@ -1,0 +1,425 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda control plane for ECS service and Route53 hosted zone. Depends on DNS stack and
+    IAM stack.
+
+Parameters:
+  # TODO: Strongly consider moving this to Secrets Manager.
+  DiscordPublicKey:
+    Type: String
+    NoEcho: true
+    Description: Public Key from Discord Developer Portal for verifying interaction signatures
+  PyNaClLayerArn:
+    Type: String
+    Description: ARN of the self-hosted PyNaCl Lambda Layer
+  MinecraftIamStackName:
+    Type: String
+    Description: The name of the IAM stack with defined roles and permissions
+  MinecraftDnsStackName:
+    Type: String
+    Description: The name of the DNS stack with the delegated hosted zone
+
+Resources:
+  # ====================================
+  # CONTROL PLANE: LAMBDA & API GATEWAY
+  # ====================================
+  TriggerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    # In dev, delete logs on stack deletion.
+    # TODO: When moving to prod, swap this from Delete to Retain
+    DeletionPolicy: Delete
+    # In dev, delete logs on LogGroup update/replace.
+    # TODO: When moving to prod, swap this from Delete to Retain
+    UpdateReplacePolicy: Delete
+    # Ignore the cfn-guard warning. The KMS cost is not worth it for this type of project.
+    Properties:
+      LogGroupName: /aws/lambda/minecraft-wake-trigger
+      RetentionInDays: 7
+
+  TriggerLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: TriggerLambdaLogGroup
+    # Ignore cfn-guard, we don't want Lambda inside a VPC.
+    Properties:
+      FunctionName: minecraft-wake-trigger
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !ImportValue
+        Fn::Sub: ${MinecraftIamStackName}-WakeLambdaRoleArn
+      Layers:
+        - !Ref PyNaClLayerArn
+      Environment:
+        Variables:
+            DISCORD_PUBLIC_KEY: !Ref DiscordPublicKey
+            # These are hard-coded so if you change these in the compute stack, make sure you change
+            # them here.
+            CLUSTER_NAME: minecraft-cluster
+            SERVICE_NAME: minecraft-service
+      Code:
+        ZipFile: |
+            import os
+            import json
+            import logging
+            import boto3
+            from botocore.exceptions import ClientError
+            from nacl.signing import VerifyKey
+            from nacl.exceptions import BadSignatureError
+
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+
+            # Environment Variables
+            DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY", "")
+            CLUSTER_NAME = os.environ.get("CLUSTER_NAME", "minecraft-cluster")
+            SERVICE_NAME = os.environ.get("SERVICE_NAME", "minecraft-service")
+
+            ecs_client = boto3.client("ecs")
+
+            def lambda_handler(event, context):
+                logger.info("Received interaction request.")
+
+                # ==========================================
+                # 1. PRE-AUTH (Computationally Inexpensive)
+                # ==========================================
+                headers = event.get("headers", {})
+                body = event.get("body", "")
+
+                # 1a. Ensure number of headers is within an expected range
+                # API Gateway typically sends 20-40 headers. Reject absurdly large payloads.
+                if not (5 <= len(headers) <= 70):
+                    logger.warning(f"Pre-Auth Failed: Unexpected header count ({len(headers)}).")
+                    return {"statusCode": 400, "body": "Bad Request"}
+
+                # 1b. Ensure body length is within expected bounds
+                # Discord payloads vary in size. PINGs are small, Slash Commands are larger.
+                if not (10 <= len(body) <= 2048):
+                    logger.warning(f"Pre-Auth Failed: Unexpected body length ({len(body)} bytes).")
+                    return {"statusCode": 400, "body": "Bad Request"}
+
+                # 1c. Ensure required authentication headers are present
+                # API Gateway HTTP APIs may lowercase headers
+                signature = headers.get("x-signature-ed25519") or headers.get("X-Signature-Ed25519")
+                timestamp = headers.get("x-signature-timestamp") or headers.get("X-Signature-Timestamp")
+                
+                if not signature or not timestamp:
+                    logger.warning("Pre-Auth Failed: Missing required signature headers.")
+                    return {"statusCode": 401, "body": "Unauthorized"}
+
+                # =================================================
+                # 2. AUTHENTICATE (Ed25519 Signature Verification)
+                # =================================================
+                try:
+                    verify_key = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
+                    # The verification string is the concatenation of timestamp and body
+                    verify_key.verify(f"{timestamp}{body}".encode("utf-8"), bytes.fromhex(signature))
+                except (BadSignatureError, ValueError) as e:
+                    logger.error(f"Authentication Failed: Signature verification failed - {e}")
+                    # If verification fails, Lambda must immediately return HTTP 401 Unauthorized
+                    return {"statusCode": 401, "body": "invalid request signature"}
+
+                # Parse the validated JSON body
+                try:
+                    payload = json.loads(body)
+                except json.JSONDecodeError:
+                    logger.error("Invalid Body Format: Unable to parse and load body as JSON.")
+                    return {"statusCode": 400, "body": "Invalid JSON format"}
+
+                interaction_type = payload.get("type")
+
+                # Handle Discord Verification PING (Type 1)
+                if interaction_type == 1:
+                    logger.info("Handling Discord PING interaction.")
+                    return {
+                        "statusCode": 200,
+                        "headers": {"Content-Type": "application/json"},
+                        "body": json.dumps({"type": 1})  # Required response: {"type": 1}
+                    }
+
+                # Handle Application Command (Type 2)
+                if interaction_type == 2:
+                    command_name = payload.get("data", {}).get("name")
+                    
+                    if command_name != "wake":
+                        logger.warning("Received unhandled command name.")
+                        return {"statusCode": 400, "body": f"Unhandled command name: {command_name}"}
+                else:
+                    logger.warning("Received unhandled interaction type.")
+                    return {"statusCode": 400, "body": f"Unhandled interaction type: {interaction_type}"}
+
+                # ============================
+                # 3. QUERY ECS SERVICE STATUS
+                # ============================
+                logger.info("Querying ECS service status...")
+                try:
+                    response = ecs_client.describe_services(
+                        cluster=CLUSTER_NAME,
+                        services=[SERVICE_NAME]
+                    )
+                    services = response.get("services", [])
+                    active_services = [svc for svc in services if svc.get('status') == 'ACTIVE']
+                    
+                    if not active_services:
+                        logger.warning(f"Service {SERVICE_NAME} not found in cluster {CLUSTER_NAME}.")
+                        message_content = "Error: Minecraft server service could not be found."
+                        return _build_discord_response(message_content)
+                        
+                    service = active_services[0]
+                    desired_count = service.get("desiredCount", 0)
+                    running_count = service.get("runningCount", 0)
+
+                except ClientError as e:
+                    logger.error(f"AWS ECS ClientError: {e}")
+                    return _build_discord_response("Failed to query server status due to an AWS service error.")
+
+                # =============================
+                # 4. EXECUTE STATE TRANSITIONS
+                # =============================     
+                if desired_count == 0:
+                    try:
+                        ecs_client.update_service(
+                            cluster=CLUSTER_NAME,
+                            service=SERVICE_NAME,
+                            desiredCount=1
+                        )
+                        logger.info("Server is offline. Scaling up to desiredCount = 1...")
+                        message_content = "Minecraft server wake-up initiated! It should be ready in 2 to 3 minutes."
+
+                    except ClientError as e:
+                        logger.error(f"AWS ECS ClientError on update_service: {e}")
+                        message_content = "Failed to trigger server wake-up due to an AWS service error."
+
+                elif desired_count == 1 and running_count == 0:
+                    logger.info("Server is already in the process of starting up.")
+                    message_content = "Minecraft server is currently booting up. Please wait a minute and try connecting."
+                else:
+                    logger.info("Server is already running.")
+                    message_content = "Minecraft server is already online and running!"
+
+                return _build_discord_response(message_content)
+
+            def _build_discord_response(message):
+                """Helper method to format the Type 4 Discord channel message."""
+                # type: 4 stands for CHANNEL_MESSAGE_WITH_SOURCE, which posts a standard reply to the user
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({
+                        "type": 4,
+                        "data": {
+                            "content": message
+                        }
+                    })
+                }
+
+  # ==================================
+  # CONTROL PLANE: DYNAMIC DNS UPDATE
+  # ==================================
+  DnsUpdateLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    # In dev, delete logs on stack deletion.
+    # TODO: When moving to prod, swap this from Delete to Retain
+    DeletionPolicy: Delete
+    # In dev, delete logs on LogGroup update/replace.
+    # TODO: When moving to prod, swap this from Delete to Retain
+    UpdateReplacePolicy: Delete
+    # Ignore the cfn-guard warning. The KMS cost is not worth it for this type of project.
+    Properties:
+      LogGroupName: /aws/lambda/minecraft-dns-update
+      RetentionInDays: 7
+
+  DnsUpdateLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: DnsUpdateLambdaLogGroup
+    # Ignore cfn-guard, we don't want Lambda inside a VPC.
+    Properties:
+      FunctionName: minecraft-dns-update
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !ImportValue
+        Fn::Sub: ${MinecraftIamStackName}-DnsUpdateLambdaRoleArn
+      Environment:
+        Variables:
+          HOSTED_ZONE_ID: !ImportValue
+            Fn::Sub: ${MinecraftDnsStackName}-HostedZoneId
+          DNS_RECORD_NAME: !Sub
+            - mc.${DomainName}
+            - DomainName: !ImportValue
+                Fn::Sub: ${MinecraftDnsStackName}-DomainName
+          DNS_TTL: '30'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import logging
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ec2_client = boto3.client('ec2')
+          route53_client = boto3.client('route53')
+
+          HOSTED_ZONE_ID = os.environ['HOSTED_ZONE_ID']
+          DNS_RECORD_NAME = os.environ['DNS_RECORD_NAME']
+          DNS_TTL = int(os.environ.get('DNS_TTL', '30'))
+
+          def extract_eni_id(event):
+              # The ENI id lives inside detail.attachments[], on the entry whose
+              # type is "eni". We don't assume attachments[0] since other
+              # attachment types could theoretically be present.
+              attachments = event.get('detail', {}).get('attachments', [])
+
+              for attachment in attachments:
+                  if attachment.get('type') != 'eni':
+                      continue
+                  for item in attachment.get('details', []):
+                      if item.get('name') == 'networkInterfaceId':
+                          return item.get('value')
+
+              raise ValueError("No networkInterfaceId found in event attachments")
+
+          def get_public_ip(eni_id):
+              # The event only carries the ENI's private IP - the public IP has
+              # to be looked up separately via EC2.
+              response = ec2_client.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
+              interfaces = response.get('NetworkInterfaces', [])
+              if not interfaces:
+                  raise ValueError(f"ENI {eni_id} not found")
+
+              association = interfaces[0].get('Association', {})
+              public_ip = association.get('PublicIp')
+              if not public_ip:
+                  raise ValueError(f"ENI {eni_id} has no associated public IP")
+
+              return public_ip
+
+          def upsert_dns_record(public_ip):
+              # UPSERT overwrites whatever value (or absence of one) currently
+              # exists for this name/type in a single atomic call - no separate
+              # read-then-delete step needed.
+              response = route53_client.change_resource_record_sets(
+                  HostedZoneId=HOSTED_ZONE_ID,
+                  ChangeBatch={
+                      'Comment': 'Minecraft server dynamic IP update',
+                      'Changes': [
+                          {
+                              'Action': 'UPSERT',
+                              'ResourceRecordSet': {
+                                  'Name': DNS_RECORD_NAME,
+                                  'Type': 'A',
+                                  'TTL': DNS_TTL,
+                                  'ResourceRecords': [{'Value': public_ip}]
+                              }
+                          }
+                      ]
+                  }
+              )
+              return response['ChangeInfo']['Id']
+
+          def lambda_handler(event, context):
+              try:
+                  eni_id = extract_eni_id(event)
+                  logger.info(f"Extracted ENI ID: {eni_id}")
+
+                  public_ip = get_public_ip(eni_id)
+                  logger.info(f"Resolved public IP: {public_ip}")
+
+                  change_id = upsert_dns_record(public_ip)
+                  logger.info(f"DNS record updated successfully. ChangeId: {change_id}")
+
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps({
+                          "message": f"Updated {DNS_RECORD_NAME} to {public_ip}",
+                          "changeId": change_id
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Failed to update DNS record: {str(e)}", exc_info=True)
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps({"message": "Failed to update DNS record"})
+                  }
+
+  DnsUpdateEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: minecraft-dns-update-on-task-running
+      Description: Fires when the Minecraft ECS task transitions to RUNNING, so the DNS Lambda can
+        publish its fresh public IP.
+      EventPattern:
+        source:
+          - aws.ecs
+        detail-type:
+          - ECS Task State Change
+        detail:
+          lastStatus:
+            - RUNNING
+          group:
+            - service:minecraft-service
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DnsUpdateLambda.Arn
+          Id: DnsUpdateLambdaTarget
+
+  DnsUpdateEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DnsUpdateLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DnsUpdateEventRule.Arn
+
+  # ===========================
+  # CONTROL PLANE: API GATEWAY
+  # ===========================
+  MinecraftApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: minecraft-trigger-api
+      ProtocolType: HTTP
+
+  MinecraftApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: [ApiDefaultRoute, ApiLambdaIntegration]
+    Properties:
+      ApiId: !Ref MinecraftApiGateway
+      StageName: $default
+      AutoDeploy: true
+      RouteSettings:
+        # Limits are cheap protection against an insane API gateway bill. However, if a bot hits
+        # the endpoint too many times with a POST /wake, the rate limit could deny legit traffic.
+        "POST /wake":
+            ThrottlingRateLimit: 1.0
+            ThrottlingBurstLimit: 2
+
+  ApiLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MinecraftApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt TriggerLambda.Arn
+      PayloadFormatVersion: '2.0'
+
+  ApiDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MinecraftApiGateway
+      RouteKey: POST /wake
+      Target: !Sub integrations/${ApiLambdaIntegration}
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TriggerLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MinecraftApiGateway}/*/POST/wake"
+
+# ===================
+# EXPORTS TO USE API
+# ===================
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API Gateway Endpoint URL for wake trigger
+    Value: !Sub https://${MinecraftApiGateway}.execute-api.${AWS::Region}.amazonaws.com/wake

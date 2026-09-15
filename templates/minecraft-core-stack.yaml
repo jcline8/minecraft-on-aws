@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Full VPC configuration and persistent EFS storage setup. No stack dependencies.
+
+Parameters:
+  AdminIp:
+    Type: String
+    Description: Public IPv4 CIDR permitted to connect to the Minecraft RCON admin port
+      (e.g., 203.0.113.25/32). Don't use 0.0.0.0/0 unless you want to have a bad day.
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid IPv4 CIDR specification, such as 203.0.113.25/32
+
+Resources:
+  # ==========================
+  # NETWORKING INFRASTRUCTURE
+  # ==========================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: name
+          Value: minecraft-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: name
+          Value: minecraft-public-subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      # Ignore cfn-guard, we want our public subnet to have a route out to the internet.
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: name
+          Value: minecraft-private-subnet
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable un-restricted Minecraft TCP 35132 and restricted RCON
+        admin access to the ECS task
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Changed from the standard Minecraft port 25565 to 35132 to avoid standard port scanners.
+        - IpProtocol: tcp
+          FromPort: 35132
+          ToPort: 35132
+          CidrIp: 0.0.0.0/0
+          Description: Public access for Minecraft (auth via online-mode + whitelist)
+        # TODO: Consider changing this port if the cidr block is ever wider than a single admin IP.
+        - IpProtocol: tcp
+          FromPort: 25575
+          ToPort: 25575
+          CidrIp: !Ref AdminIp
+          Description: Restricted admin access for RCON
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS access to EFS for the Minecraft ECS task only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # NFS port for EFS limited to the resources with the ECS security group. (i.e., only our ECS
+        # service in the compute stack.)
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EcsSecurityGroup
+          Description: NFS access restricted to the Minecraft ECS task security group
+
+  # =======================
+  # STORAGE INFRASTRUCTURE
+  # =======================
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem 
+    # TODO: When moving to prod, swap this from Delete to Retain
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: name
+          Value: minecraft-data
+
+  EfsMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      # These need to match our minecraft user UID/GID set in the Dockerfile. No offset required.
+      PosixUser:
+        Uid: '1000'
+        Gid: '1000'
+      RootDirectory:
+        Path: /minecraft
+        CreationInfo:
+          OwnerUid: '1000'
+          OwnerGid: '1000'
+          Permissions: '755'
+
+# ==========================
+# EXPORTS FOR COMPUTE STACK
+# ==========================
+Outputs:
+  EfsFileSystemId:
+    Value: !Ref EfsFileSystem
+    Export:
+      Name: !Sub ${AWS::StackName}-EfsFileSystemId
+
+  EfsAccessPointId:
+    Value: !Ref EfsAccessPoint
+    Export:
+      Name: !Sub ${AWS::StackName}-EfsAccessPointId
+
+  PublicSubnet:
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnet
+
+  EcsSecurityGroup:
+    Value: !Ref EcsSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-EcsSecurityGroup
